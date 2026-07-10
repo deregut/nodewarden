@@ -1,29 +1,45 @@
-import { Env, TokenResponse } from '../types';
+import { Env, TokenResponse, User } from '../types';
 import { StorageService } from '../services/storage';
 import { AuthService } from '../services/auth';
 import { RateLimitService, getClientIdentifier } from '../services/ratelimit';
 import { jsonResponse, errorResponse, identityErrorResponse } from '../utils/response';
 import { LIMITS } from '../config/limits';
-import { isTotpEnabled, verifyTotpToken } from '../utils/totp';
+import { findMatchingTotpCounter, isTotpEnabled } from '../utils/totp';
 import { createRefreshToken } from '../utils/jwt';
 import { readAuthRequestDeviceInfo } from '../utils/device';
 import { createRecoveryCode, recoveryCodeEquals } from '../utils/recovery-code';
 import { generateUUID } from '../utils/uuid';
 import { issueSendAccessToken } from './sends';
+import { registerMobilePushDevice } from '../services/push-relay';
 import {
   buildAccountKeys,
   buildUserDecryptionOptions,
 } from '../utils/user-decryption';
 import { auditRequestMetadata, safeWriteAuditEvent } from '../services/audit-events';
+import {
+  assertAccountPasskeyCredential,
+  assertTwoFactorPasskeyCredential,
+  buildAccountPasskeyTokenUserDecryptionOption,
+  buildTwoFactorPasskeyAssertionOptions,
+} from './account-passkeys';
+import { isAuthRequestExpired } from '../services/storage-auth-request-repo';
+import { createPasskeyUserVerificationToken } from '../utils/user-verification-token';
+import { constantTimeEquals, verifyApiKey } from '../utils/api-key';
+import { isYubiKeyEnabled, userYubiKeyPublicIds, verifyYubicoOtp, yubicoCredentialsFromEnv, yubiKeyPublicIdFromOtp, type YubicoApiCredentials } from '../utils/yubico-otp';
 
 const TWO_FACTOR_REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const TWO_FACTOR_PROVIDER_AUTHENTICATOR = 0;
+const TWO_FACTOR_PROVIDER_YUBIKEY = 3;
 const TWO_FACTOR_PROVIDER_REMEMBER = 5;
+const TWO_FACTOR_PROVIDER_WEBAUTHN = 7;
+const TWO_FACTOR_PROVIDER_RECOVERY_CODE = 8;
 const WEB_REFRESH_COOKIE = 'nodewarden_web_refresh';
-// Android client (2026.2.x) deserializes TwoFactorProviders2 keys with -1 for recovery code.
-// Keep request parsing backward-compatible with historical provider values (8 / 100).
+const YUBICO_CLIENT_ID_CONFIG_KEY = 'globalSettings__yubico__clientId';
+const YUBICO_KEY_CONFIG_KEY = 'globalSettings__yubico__key';
+// Some UI surfaces use -1 for the recovery-code settings dialog. Login itself follows
+// the official Identity provider enum (RecoveryCode = 8), while request parsing remains
+// compatible with older/local provider values.
 const TWO_FACTOR_PROVIDER_RECOVERY_CODE_RESPONSE = '-1';
-const TWO_FACTOR_PROVIDER_RECOVERY_CODE_LEGACY = 8;
 const TWO_FACTOR_PROVIDER_RECOVERY_CODE_ANDROID_REQUEST = 100;
 
 function resolveTotpSecret(userSecret: string | null): string | null {
@@ -44,6 +60,44 @@ async function resolveDeviceSession(
   return { identifier: deviceInfo.deviceIdentifier, sessionStamp };
 }
 
+function readDevicePushToken(body: Record<string, string>): string {
+  return String(readBodyValue(body, ['devicePushToken', 'DevicePushToken', 'device_push_token']) || '').trim();
+}
+
+async function persistIdentityDevicePushToken(
+  env: Env,
+  storage: StorageService,
+  userId: string,
+  deviceSession: { identifier: string; sessionStamp: string } | null,
+  deviceType: number,
+  body: Record<string, string>
+): Promise<void> {
+  if (!deviceSession) return;
+  const pushToken = readDevicePushToken(body);
+  if (!pushToken) return;
+
+  const device = await storage.getDevice(userId, deviceSession.identifier);
+  if (!device) return;
+
+  const pushUuid = device.pushUuid || generateUUID();
+  await storage.updateDevicePushToken(userId, deviceSession.identifier, pushUuid, pushToken);
+  const registered = await registerMobilePushDevice(env, {
+    userId,
+    deviceIdentifier: deviceSession.identifier,
+    type: device.type || deviceType,
+    pushUuid,
+    pushToken,
+  });
+  console.info('Mobile push token updated from identity token request', {
+    userId,
+    deviceIdentifier: deviceSession.identifier,
+    deviceType: device.type || deviceType,
+    pushUuid,
+    pushTokenLength: pushToken.length,
+    relayRegistered: registered,
+  });
+}
+
 function shouldUseWebSession(request: Request): boolean {
   return String(request.headers.get('X-NodeWarden-Web-Session') || '').trim() === '1';
 }
@@ -60,16 +114,31 @@ function parseCookieValue(request: Request, name: string): string | null {
   return null;
 }
 
-function constantTimeEquals(a: string, b: string): boolean {
-  const encA = new TextEncoder().encode(a);
-  const encB = new TextEncoder().encode(b);
-  if (encA.length !== encB.length) return false;
-
-  let diff = 0;
-  for (let i = 0; i < encA.length; i++) {
-    diff |= encA[i] ^ encB[i];
+function readBodyValue(body: Record<string, string>, names: string[]): string | undefined {
+  for (const name of names) {
+    const value = body[name];
+    if (value != null) return value;
   }
-  return diff === 0;
+  return undefined;
+}
+
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function loginRateLimitKey(clientIdentifier: string, grantType: string, subject: string): Promise<string> {
+  const subjectHash = await sha256Hex(`${grantType}:${String(subject || '').trim() || 'unknown'}`);
+  return `${clientIdentifier}:login:${grantType}:${subjectHash}`;
+}
+
+async function getStoredYubicoCredentials(storage: StorageService, env: Env): Promise<YubicoApiCredentials | null> {
+  const fromEnv = yubicoCredentialsFromEnv(env);
+  if (fromEnv) return fromEnv;
+  const clientId = String(await storage.getConfigValue(YUBICO_CLIENT_ID_CONFIG_KEY) || '').trim();
+  if (!clientId) return null;
+  const secretKey = String(await storage.getConfigValue(YUBICO_KEY_CONFIG_KEY) || '').trim();
+  return { clientId, secretKey };
 }
 
 function buildRefreshCookie(request: Request, refreshToken: string, maxAgeSeconds: number): string {
@@ -104,6 +173,30 @@ function withWebRefreshCookie(request: Request, response: Response, refreshToken
   });
 }
 
+async function revokePresentedAccessTokenSession(request: Request, env: Env, storage: StorageService): Promise<void> {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader) return;
+
+  const auth = new AuthService(env);
+  const verified = await auth.verifyAccessTokenWithUser(authHeader);
+  if (!verified) return;
+
+  const deviceIdentifier = String(verified.payload.did || '').trim();
+  if (deviceIdentifier) {
+    const nextSessionStamp = generateUUID();
+    await storage.rotateDeviceSessionStamp(verified.user.id, deviceIdentifier, nextSessionStamp);
+    await storage.deleteRefreshTokensByDevice(verified.user.id, deviceIdentifier);
+    AuthService.invalidateDeviceCache(verified.user.id, deviceIdentifier);
+    return;
+  }
+
+  verified.user.securityStamp = generateUUID();
+  verified.user.updatedAt = new Date().toISOString();
+  await storage.saveUser(verified.user);
+  await storage.deleteRefreshTokensByUserId(verified.user.id);
+  AuthService.invalidateUserCache(verified.user.id);
+}
+
 function buildPreloginResponse(
   email: string,
   kdfType: number,
@@ -126,19 +219,51 @@ function buildPreloginResponse(
   };
 }
 
-function twoFactorRequiredResponse(message: string = 'Two factor required.', includeRecoveryCode: boolean = false): Response {
-  const providers = includeRecoveryCode
-    ? [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR), TWO_FACTOR_PROVIDER_RECOVERY_CODE_RESPONSE]
-    : [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)];
-  const providers2: Record<string, null> = {};
-  for (const provider of providers) providers2[provider] = null;
+function masterPasswordPolicyResponse(): TokenResponse['MasterPasswordPolicy'] {
+  return {
+    minComplexity: 0,
+    minLength: 0,
+    requireUpper: false,
+    requireLower: false,
+    requireNumbers: false,
+    requireSpecial: false,
+    enforceOnLogin: false,
+    Object: 'masterPasswordPolicy',
+    object: 'masterPasswordPolicy',
+  };
+}
+
+async function twoFactorRequiredResponse(
+  request: Request,
+  env: Env,
+  storage: StorageService,
+  user?: User,
+  message: string = 'Two factor required.'
+): Promise<Response> {
+  // Match Bitwarden Identity: TwoFactorProviders2 lists enabled 2FA providers only.
+  // Clients expose recovery-code entry points themselves; Android 2026.4 fails to
+  // parse the challenge if an unknown recovery provider key such as "8" is included.
+  const providers: string[] = [];
+  let webAuthnOptions: Record<string, unknown> | null = null;
+  if (!user || resolveTotpSecret(user.totpSecret)) providers.push(String(TWO_FACTOR_PROVIDER_AUTHENTICATOR));
+  if (user && isYubiKeyEnabled(user)) providers.push(String(TWO_FACTOR_PROVIDER_YUBIKEY));
+  if (user) {
+    webAuthnOptions = await buildTwoFactorPasskeyAssertionOptions(request, env, storage, user) as Record<string, unknown> | null;
+    if (webAuthnOptions) providers.push(String(TWO_FACTOR_PROVIDER_WEBAUTHN));
+  }
+  const providers2: Record<string, Record<string, unknown> | null> = {};
+  for (const provider of providers) {
+    providers2[provider] = provider === String(TWO_FACTOR_PROVIDER_YUBIKEY)
+      ? { Nfc: user?.yubikeyNfc ?? false }
+      : provider === String(TWO_FACTOR_PROVIDER_WEBAUTHN) && webAuthnOptions
+        ? webAuthnOptions
+        : null;
+  }
   const customResponse = {
     TwoFactorProviders: providers,
     TwoFactorProviders2: providers2,
     SsoEmail2faSessionToken: null,
-    MasterPasswordPolicy: {
-      Object: 'masterPasswordPolicy',
-    },
+    MasterPasswordPolicy: masterPasswordPolicyResponse(),
   };
 
   // Bitwarden clients rely on these fields to trigger the 2FA UI flow.
@@ -224,16 +349,17 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
     // Login with password
     const email = body.username?.toLowerCase();
     const passwordHash = body.password;
-    const twoFactorToken = body.twoFactorToken;
-    const twoFactorProvider = body.twoFactorProvider;
-    const twoFactorRemember = body.twoFactorRemember;
-    const loginIdentifier = `${clientIdentifier}:${email}`;
+    const authRequestId = readBodyValue(body, ['authRequest', 'AuthRequest']);
+    const twoFactorToken = readBodyValue(body, ['twoFactorToken', 'TwoFactorToken']);
+    const twoFactorProvider = readBodyValue(body, ['twoFactorProvider', 'TwoFactorProvider']);
+    const twoFactorRemember = readBodyValue(body, ['twoFactorRemember', 'TwoFactorRemember']);
     const deviceInfo = readAuthRequestDeviceInfo(body, request);
 
     if (!email || !passwordHash) {
       // Bitwarden clients expect OAuth-style error fields.
       return identityErrorResponse('Email and password are required', 'invalid_request', 400);
     }
+    const loginIdentifier = await loginRateLimitKey(clientIdentifier, grantType, email);
 
     // Check login lockout before user lookup to reduce user-enumeration signal
     const loginCheck = await rateLimit.checkLoginAttempt(loginIdentifier);
@@ -268,11 +394,34 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       return identityErrorResponse('Account is disabled', 'invalid_grant', 400);
     }
 
-    const valid = await auth.verifyPassword(passwordHash, user.masterPasswordHash, user.email);
+    let validatedAuthRequestId: string | null = null;
+    let authRequestLoginKey: string | null = null;
+    let valid = false;
+    const normalizedAuthRequestId = String(authRequestId || '').trim();
+    if (normalizedAuthRequestId) {
+      const authRequest = await storage.getAuthRequestByIdForUser(normalizedAuthRequestId, user.id);
+      valid = !!(
+        authRequest &&
+        authRequest.userId === user.id &&
+        authRequest.type === 0 &&
+        authRequest.approved === true &&
+        authRequest.responseDate &&
+        !authRequest.authenticationDate &&
+        !isAuthRequestExpired(authRequest) &&
+        !!authRequest.key &&
+        constantTimeEquals(authRequest.accessCode, passwordHash)
+      );
+      if (valid) {
+        validatedAuthRequestId = authRequest!.id;
+        authRequestLoginKey = authRequest!.key;
+      }
+    } else {
+      valid = await auth.verifyPassword(passwordHash, user.masterPasswordHash, user.email);
+    }
     if (!valid) {
       await safeWriteAuditEvent(env, {
         actorUserId: user.id,
-        action: 'auth.login.failed.bad_password',
+        action: normalizedAuthRequestId ? 'auth.login.failed.bad_auth_request' : 'auth.login.failed.bad_password',
         category: 'auth',
         level: 'warn',
         targetType: 'user',
@@ -290,11 +439,12 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       );
     }
 
-    // Optional 2FA: enabled only by per-user secret.
+    // Optional 2FA: enabled by any supported per-user provider.
     let trustedTwoFactorTokenToReturn: string | undefined;
     const effectiveTotpSecret = resolveTotpSecret(user.totpSecret);
-    if (effectiveTotpSecret) {
-      const canUseRecoveryCode = !!user.totpRecoveryCode;
+    const effectiveYubiKeyPublicIds = userYubiKeyPublicIds(user);
+    const effectiveWebAuthnCredentials = await storage.getAccountPasskeyCredentialsByUserId(user.id, 'twoFactor');
+    if (effectiveTotpSecret || effectiveYubiKeyPublicIds.length > 0 || effectiveWebAuthnCredentials.length > 0) {
       const normalizedTwoFactorProvider = String(twoFactorProvider ?? '').trim();
       const normalizedTwoFactorToken = String(twoFactorToken ?? '').trim();
       let rememberRequested = ['1', 'true', 'True', 'TRUE', 'on', 'yes', 'Yes', 'YES'].includes(String(twoFactorRemember || '').trim());
@@ -304,7 +454,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       // Upstream-compatible behavior: if 2FA is required and either provider or token is missing,
       // respond with a 2FA challenge payload.
       if (!hasProvider || !hasToken) {
-        return twoFactorRequiredResponse('Two factor required.', canUseRecoveryCode);
+        return await twoFactorRequiredResponse(request, env, storage, user, 'Two factor required.');
       }
 
       let passedByRememberToken = false;
@@ -319,26 +469,68 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
 
         // Remember token missing/invalid/expired should re-enter the 2FA challenge flow.
         if (!passedByRememberToken) {
-          return twoFactorRequiredResponse('Two factor required.', canUseRecoveryCode);
+          return await twoFactorRequiredResponse(request, env, storage, user, 'Two factor required.');
         }
       } else if (normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)) {
-        const totpOk = await verifyTotpToken(effectiveTotpSecret, normalizedTwoFactorToken);
-        if (!totpOk) {
+        if (!effectiveTotpSecret) {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+        const matchedCounter = await findMatchingTotpCounter(effectiveTotpSecret, normalizedTwoFactorToken);
+        if (matchedCounter == null) {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+        const consumed = await storage.consumeTotpLoginCounter(user.id, matchedCounter);
+        if (!consumed) {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+      } else if (normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_YUBIKEY)) {
+        const publicId = yubiKeyPublicIdFromOtp(normalizedTwoFactorToken);
+        if (!publicId || !effectiveYubiKeyPublicIds.includes(publicId)) {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+        const credentials = await getStoredYubicoCredentials(storage, env);
+        if (!credentials || !await verifyYubicoOtp(env, normalizedTwoFactorToken, credentials)) {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+      } else if (normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_WEBAUTHN)) {
+        if (!effectiveWebAuthnCredentials.length) {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+        let deviceResponse: unknown;
+        try {
+          deviceResponse = JSON.parse(normalizedTwoFactorToken);
+        } catch {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+        try {
+          await assertTwoFactorPasskeyCredential(request, env, storage, user, deviceResponse);
+        } catch {
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
       } else if (
         normalizedTwoFactorProvider === TWO_FACTOR_PROVIDER_RECOVERY_CODE_RESPONSE ||
-        normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_RECOVERY_CODE_LEGACY) ||
+        normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_RECOVERY_CODE) ||
         normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_RECOVERY_CODE_ANDROID_REQUEST)
       ) {
         if (!recoveryCodeEquals(normalizedTwoFactorToken, user.totpRecoveryCode)) {
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
         user.totpSecret = null;
+        user.yubikeyKey1 = null;
+        user.yubikeyKey2 = null;
+        user.yubikeyKey3 = null;
+        user.yubikeyKey4 = null;
+        user.yubikeyKey5 = null;
+        user.yubikeyNfc = false;
+        for (const credential of effectiveWebAuthnCredentials) {
+          await storage.deleteAccountPasskeyCredential(user.id, credential.id, 'twoFactor');
+        }
         user.totpRecoveryCode = createRecoveryCode();
+        user.securityStamp = generateUUID();
         user.updatedAt = new Date().toISOString();
         await storage.saveUser(user);
         await storage.deleteRefreshTokensByUserId(user.id);
+        AuthService.invalidateUserCache(user.id);
         rememberRequested = false;
       } else {
         // Unsupported provider for this server profile behaves as an invalid 2FA attempt.
@@ -367,10 +559,14 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
         deviceInfo.deviceType,
         deviceSession.sessionStamp
       );
+      await persistIdentityDevicePushToken(env, storage, user.id, deviceSession, deviceInfo.deviceType, body);
     }
 
     // Successful login - clear failed attempts
     await rateLimit.clearLoginAttempts(loginIdentifier);
+    if (validatedAuthRequestId) {
+      await storage.markAuthRequestAuthenticated(validatedAuthRequestId);
+    }
 
     const accessToken = await auth.generateAccessToken(user, deviceSession);
     const refreshToken = await auth.generateRefreshToken(user.id, deviceSession);
@@ -398,6 +594,126 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       token_type: 'Bearer',
       ...(shouldUseWebSession(request) ? { web_session: true } : { refresh_token: refreshToken }),
       ...(trustedTwoFactorTokenToReturn ? { TwoFactorToken: trustedTwoFactorTokenToReturn } : {}),
+      Key: authRequestLoginKey || user.key,
+      PrivateKey: user.privateKey,
+      AccountKeys: accountKeys,
+      accountKeys: accountKeys,
+      Kdf: user.kdfType,
+      KdfIterations: user.kdfIterations,
+      KdfMemory: user.kdfMemory,
+      KdfParallelism: user.kdfParallelism,
+      ForcePasswordReset: false,
+      ResetMasterPassword: false,
+      MasterPasswordPolicy: masterPasswordPolicyResponse(),
+      ApiUseKeyConnector: false,
+      scope: 'api offline_access',
+      unofficialServer: true,
+      UserDecryptionOptions: userDecryptionOptions,
+      userDecryptionOptions: userDecryptionOptions,
+    };
+
+    const baseResponse = jsonResponse(response);
+    return shouldUseWebSession(request)
+      ? withWebRefreshCookie(request, baseResponse, refreshToken)
+      : baseResponse;
+
+  } else if (grantType === 'webauthn') {
+    const token = String(body.token || '').trim();
+    const loginIdentifier = await loginRateLimitKey(clientIdentifier, grantType, token || 'missing-token');
+    const loginCheck = await rateLimit.checkLoginAttempt(loginIdentifier);
+    if (!loginCheck.allowed) {
+      return identityErrorResponse(
+        `Too many failed login attempts. Try again in ${Math.ceil(loginCheck.retryAfterSeconds! / 60)} minutes.`,
+        'TooManyRequests',
+        429
+      );
+    }
+
+    let deviceResponse: unknown = body.deviceResponse;
+    if (typeof deviceResponse === 'string') {
+      try {
+        deviceResponse = JSON.parse(deviceResponse);
+      } catch {
+        return identityErrorResponse('Invalid passkey response', 'invalid_request', 400);
+      }
+    }
+    if (!token || !deviceResponse) {
+      return identityErrorResponse('Passkey token and deviceResponse are required', 'invalid_request', 400);
+    }
+
+    let asserted: Awaited<ReturnType<typeof assertAccountPasskeyCredential>>;
+    try {
+      asserted = await assertAccountPasskeyCredential(request, env, storage, {
+        token,
+        deviceResponse,
+        scope: 'Authentication',
+      });
+    } catch (error) {
+      await rateLimit.recordFailedLogin(loginIdentifier);
+      await safeWriteAuditEvent(env, {
+        actorUserId: null,
+        action: 'auth.passkey.login.failed',
+        category: 'auth',
+        level: 'warn',
+        targetType: 'accountPasskey',
+        targetId: null,
+        metadata: {
+          grantType,
+          reason: error instanceof Error ? error.message : 'assertion_failed',
+          ...auditRequestMetadata(request),
+        },
+      });
+      return identityErrorResponse('Passkey is invalid. Try again', 'invalid_grant', 400);
+    }
+
+    const { user, credential } = asserted;
+    if (user.status !== 'active') {
+      await rateLimit.recordFailedLogin(loginIdentifier);
+      return identityErrorResponse('Account is disabled', 'invalid_grant', 400);
+    }
+
+    const deviceInfo = readAuthRequestDeviceInfo(body, request);
+    const deviceSession = await resolveDeviceSession(storage, user.id, deviceInfo);
+    if (deviceSession) {
+      await storage.upsertDevice(
+        user.id,
+        deviceSession.identifier,
+        deviceInfo.deviceName,
+        deviceInfo.deviceType,
+        deviceSession.sessionStamp
+      );
+      await persistIdentityDevicePushToken(env, storage, user.id, deviceSession, deviceInfo.deviceType, body);
+    }
+
+    await rateLimit.clearLoginAttempts(loginIdentifier);
+
+    const accessToken = await auth.generateAccessToken(user, deviceSession);
+    const refreshToken = await auth.generateRefreshToken(user.id, deviceSession);
+    const userVerificationToken = await createPasskeyUserVerificationToken(env, user.id, 'backup.settings.repair');
+    const accountKeys = buildAccountKeys(user);
+    const webAuthnPrfOption = buildAccountPasskeyTokenUserDecryptionOption(credential);
+    const userDecryptionOptions = buildUserDecryptionOptions(user, webAuthnPrfOption);
+    await safeWriteAuditEvent(env, {
+      actorUserId: user.id,
+      action: 'auth.passkey.login.success',
+      category: 'auth',
+      level: 'info',
+      targetType: 'accountPasskey',
+      targetId: credential.id,
+      metadata: {
+        grantType,
+        webSession: shouldUseWebSession(request),
+        deviceIdentifier: deviceSession?.identifier ?? deviceInfo.deviceIdentifier,
+        deviceType: deviceInfo.deviceType,
+        ...auditRequestMetadata(request),
+      },
+    });
+
+    const response: TokenResponse = {
+      access_token: accessToken,
+      expires_in: LIMITS.auth.accessTokenTtlSeconds,
+      token_type: 'Bearer',
+      ...(shouldUseWebSession(request) ? { web_session: true } : { refresh_token: refreshToken }),
       Key: user.key,
       PrivateKey: user.privateKey,
       AccountKeys: accountKeys,
@@ -408,12 +724,12 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       KdfParallelism: user.kdfParallelism,
       ForcePasswordReset: false,
       ResetMasterPassword: false,
-      MasterPasswordPolicy: {
-        Object: 'masterPasswordPolicy',
-      },
+      MasterPasswordPolicy: masterPasswordPolicyResponse(),
       ApiUseKeyConnector: false,
       scope: 'api offline_access',
       unofficialServer: true,
+      UserVerificationToken: userVerificationToken,
+      userVerificationToken,
       UserDecryptionOptions: userDecryptionOptions,
       userDecryptionOptions: userDecryptionOptions,
     };
@@ -430,11 +746,12 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
     const scope = body.scope;
     const deviceInfo = readAuthRequestDeviceInfo(body, request);
 
-    const loginIdentifier = `${clientIdentifier}:${clientId}`;
     const parmValid = checkClientCredentialsParam(clientId, clientSecret, scope);
     if (!parmValid) {
       return identityErrorResponse('Parameter error', 'invalid_request', 400);
     }
+    const uid = clientId.slice(5);
+    const loginIdentifier = await loginRateLimitKey(clientIdentifier, grantType, uid);
 
     // Check login lockout before user lookup to reduce user-enumeration signal
     const loginCheck = await rateLimit.checkLoginAttempt(loginIdentifier);
@@ -446,7 +763,6 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       );
     }
 
-    const uid = clientId.slice(5);
     const user = await storage.getUserById(uid);
     if (!user) {
       await rateLimit.recordFailedLogin(loginIdentifier);
@@ -470,7 +786,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       return identityErrorResponse('Account is disabled', 'invalid_grant', 400);
     }
 
-    if (!user.apiKey || !constantTimeEquals(clientSecret, user.apiKey)) {
+    if (!user.apiKey || !(await verifyApiKey(clientSecret, user.apiKey))) {
       await rateLimit.recordFailedLogin(loginIdentifier);
       await safeWriteAuditEvent(env, {
         actorUserId: user.id,
@@ -498,6 +814,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
         deviceInfo.deviceType,
         deviceSession.sessionStamp
       );
+      await persistIdentityDevicePushToken(env, storage, user.id, deviceSession, deviceInfo.deviceType, body);
     }
 
     // Successful login - clear failed attempts
@@ -538,9 +855,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       KdfParallelism: user.kdfParallelism,
       ForcePasswordReset: false,
       ResetMasterPassword: false,
-      MasterPasswordPolicy: {
-        Object: 'masterPasswordPolicy',
-      },
+      MasterPasswordPolicy: masterPasswordPolicyResponse(),
       ApiUseKeyConnector: false,
       scope: 'api offline_access',
       unofficialServer: true,
@@ -590,7 +905,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       passwordHashB64,
       password,
       rateLimit,
-      `${clientIdentifier}:send-password`
+      clientIdentifier
     );
     if ('error' in result) {
       return result.error;
@@ -678,9 +993,7 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       KdfParallelism: user.kdfParallelism,
       ForcePasswordReset: false,
       ResetMasterPassword: false,
-      MasterPasswordPolicy: {
-        Object: 'masterPasswordPolicy',
-      },
+      MasterPasswordPolicy: masterPasswordPolicyResponse(),
       ApiUseKeyConnector: false,
       scope: 'api offline_access',
       unofficialServer: true,
@@ -731,6 +1044,11 @@ export async function handlePrelogin(request: Request, env: Env): Promise<Respon
 // RFC 7009 allows returning 200 even if token is unknown.
 export async function handleRevocation(request: Request, env: Env): Promise<Response> {
   const storage = new StorageService(env.DB);
+  try {
+    await revokePresentedAccessTokenSession(request, env, storage);
+  } catch {
+    // RFC 7009 revocation is best-effort and should not reveal token state.
+  }
 
   let body: Record<string, string>;
   const contentType = request.headers.get('content-type') || '';

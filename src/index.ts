@@ -1,5 +1,6 @@
 import { Env } from './types';
 import { NotificationsHub } from './durable/notifications-hub';
+import { BackupTransferRunner } from './durable/backup-transfer-runner';
 import { handleRequest } from './router';
 import { StorageService } from './services/storage';
 import { applyCors, jsonResponse } from './utils/response';
@@ -88,7 +89,7 @@ export default {
     const normalizedRequest = normalizeRequestUrl(request);
     const assetResponse = await maybeServeAsset(normalizedRequest, env);
     if (assetResponse) {
-      return applyCors(normalizedRequest, assetResponse);
+      return applyCors(normalizedRequest, assetResponse, env);
     }
 
     await ensureDatabaseInitialized(env);
@@ -106,11 +107,11 @@ export default {
         },
         500
       );
-      return applyCors(normalizedRequest, resp);
+      return applyCors(normalizedRequest, resp, env);
     }
 
     const resp = await handleRequest(normalizedRequest, env);
-    return applyCors(normalizedRequest, resp);
+    return applyCors(normalizedRequest, resp, env);
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -127,3 +128,4 @@ export default {
 };
 
 export { NotificationsHub };
+export { BackupTransferRunner };
